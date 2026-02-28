@@ -1,0 +1,11 @@
+{
+  "sources": [
+    {
+      "id": "hello.txt",
+      "type": "txt",
+      "enabled": true,
+      "raw_path": "files_raw\\hello.txt",
+      "text_path": "files_extracted\\hello.txt"
+    }
+  ]
+}
