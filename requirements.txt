@@ -1,7 +1,10 @@
-gradio
+gradio[oauth]
 chromadb
 sentence-transformers
 pypdf
 python-pptx
 requests
 huggingface_hub
+beautifulsoup4
+lxml
+langchain-groq

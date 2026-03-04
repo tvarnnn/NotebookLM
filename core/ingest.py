@@ -2,154 +2,180 @@ from __future__ import annotations
 
 import json
 import shutil
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import Optional
 
-from pypdf import PdfReader
-from pptx import Presentation
+from core.extract import extract_any, extract_url
+from core.chunking import chunk_text
+from core.vectorstore import upsert_chunks
 
-from storage.paths import notebook_root
+from storage.paths import notebook_dir
 
 
 @dataclass
-class SourceMeta:
-    id: str           # filename (unique per notebook)
-    type: str         # pdf/txt/pptx/url
+class SourceItem:
+    id: str
+    type: str
     enabled: bool
     raw_path: str
     text_path: str
+    location_hint: str = ""
 
 
-def _sources_json_path(nb_root: Path) -> Path:
-    return nb_root / "sources.json"
+def _sources_file(username: str, notebook_id: str) -> Path:
+    return notebook_dir(username, notebook_id) / "sources.json"
 
 
-def _load_sources(nb_root: Path) -> dict:
-    p = _sources_json_path(nb_root)
+def _load_sources(username: str, notebook_id: str) -> list[SourceItem]:
+    p = _sources_file(username, notebook_id)
     if not p.exists():
-        return {"sources": []}
-    return json.loads(p.read_text(encoding="utf-8"))
-
-
-def _save_sources(nb_root: Path, data: dict) -> None:
-    p = _sources_json_path(nb_root)
-    p.write_text(json.dumps(data, indent=2), encoding="utf-8")
-
-
-def _upsert_source(nb_root: Path, meta: SourceMeta) -> None:
-    data = _load_sources(nb_root)
-    items = data.get("sources", [])
-    for i, it in enumerate(items):
-        if it.get("id") == meta.id:
-            items[i] = asdict(meta)
-            break
-    else:
-        items.append(asdict(meta))
-    data["sources"] = items
-    _save_sources(nb_root, data)
-
-
-def list_sources(username: str, notebook_id: str) -> List[SourceMeta]:
-    nb_root = notebook_root(username, notebook_id)
-    data = _load_sources(nb_root)
-    out: List[SourceMeta] = []
-    for it in data.get("sources", []):
-        out.append(
-            SourceMeta(
-                id=str(it["id"]),
-                type=str(it.get("type", "unknown")),
-                enabled=bool(it.get("enabled", True)),
-                raw_path=str(it.get("raw_path", "")),
-                text_path=str(it.get("text_path", "")),
+        return []
+    data = json.loads(p.read_text(encoding="utf-8"))
+    items = []
+    for s in data.get("sources", []):
+        items.append(
+            SourceItem(
+                id=s["id"],
+                type=s["type"],
+                enabled=bool(s.get("enabled", True)),
+                raw_path=s["raw_path"],
+                text_path=s["text_path"],
+                location_hint=s.get("location_hint", ""),
             )
         )
-    return out
+    return items
+
+
+def _save_sources(username: str, notebook_id: str, sources: list[SourceItem]) -> None:
+    p = _sources_file(username, notebook_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "sources": [
+            {
+                "id": s.id,
+                "type": s.type,
+                "enabled": s.enabled,
+                "raw_path": s.raw_path,
+                "text_path": s.text_path,
+                "location_hint": s.location_hint,
+            }
+            for s in sources
+        ]
+    }
+    p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def list_sources(username: str, notebook_id: str) -> list[SourceItem]:
+    return _load_sources(username, notebook_id)
 
 
 def set_source_enabled(username: str, notebook_id: str, source_id: str, enabled: bool) -> None:
-    nb_root = notebook_root(username, notebook_id)
-    data = _load_sources(nb_root)
-    items = data.get("sources", [])
-    for it in items:
-        if it.get("id") == source_id:
-            it["enabled"] = bool(enabled)
-            break
-    data["sources"] = items
-    _save_sources(nb_root, data)
+    sources = _load_sources(username, notebook_id)
+    for s in sources:
+        if s.id == source_id:
+            s.enabled = bool(enabled)
+    _save_sources(username, notebook_id, sources)
 
 
-def _extract_pdf_text(pdf_path: Path) -> str:
-    reader = PdfReader(str(pdf_path))
-    pages = []
-    for i, page in enumerate(reader.pages):
-        text = page.extract_text() or ""
-        pages.append(f"\n\n--- Page {i + 1} ---\n{text}")
-    return "\n".join(pages)
-
-
-def _extract_txt_text(txt_path: Path) -> str:
-    return txt_path.read_text(encoding="utf-8", errors="ignore")
-
-
-def _extract_pptx_text(pptx_path: Path) -> str:
-    prs = Presentation(str(pptx_path))
-    chunks = []
-    for si, slide in enumerate(prs.slides, start=1):
-        slide_text = []
-        for shape in slide.shapes:
-            if hasattr(shape, "text") and shape.text:
-                slide_text.append(shape.text)
-        if slide_text:
-            chunks.append(f"\n\n--- Slide {si} ---\n" + "\n".join(slide_text))
-    return "\n".join(chunks)
-
-
-def ingest_files(*, username: str, notebook_id: str, files: List[Path]) -> List[str]:
-    nb_root = notebook_root(username, notebook_id)
-    raw_dir = nb_root / "files_raw"
-    ext_dir = nb_root / "files_extracted"
+def ingest_files(*, username: str, notebook_id: str, files: list[Path]) -> list[str]:
+    nb = notebook_dir(username, notebook_id)
+    raw_dir = nb / "files_raw"
+    ext_dir = nb / "files_extracted"
+    chroma_dir = nb / "chroma"
     raw_dir.mkdir(parents=True, exist_ok=True)
     ext_dir.mkdir(parents=True, exist_ok=True)
+    chroma_dir.mkdir(parents=True, exist_ok=True)
 
-    ingested: List[str] = []
+    sources = _load_sources(username, notebook_id)
+    ingested_names: list[str] = []
 
-    for f in files:
-        src = Path(f)
+    for src in files:
         if not src.exists():
             continue
 
-        suffix = src.suffix.lower()
-        if suffix not in (".pdf", ".txt", ".pptx"):
+        extracted = extract_any(src)
+        if extracted is None:
             continue
 
-        dest = raw_dir / src.name
-        shutil.copy2(src, dest)
+        # copy raw
+        raw_path = raw_dir / src.name
+        shutil.copyfile(src, raw_path)
 
-        if suffix == ".pdf":
-            text = _extract_pdf_text(dest)
-            typ = "pdf"
-        elif suffix == ".pptx":
-            text = _extract_pptx_text(dest)
-            typ = "pptx"
-        else:
-            text = _extract_txt_text(dest)
-            typ = "txt"
+        # save extracted text
+        text_path = ext_dir / (src.stem + ".txt")
+        text_path.write_text(extracted.text, encoding="utf-8", errors="ignore")
 
-        out_txt = ext_dir / f"{src.stem}.txt"
-        out_txt.write_text(text, encoding="utf-8")
-
-        _upsert_source(
-            nb_root,
-            SourceMeta(
-                id=src.name,
-                type=typ,
-                enabled=True,
-                raw_path=str(Path("files_raw") / src.name),
-                text_path=str(Path("files_extracted") / f"{src.stem}.txt"),
-            ),
+        # update sources.json
+        item = SourceItem(
+            id=src.name,
+            type=src.suffix.lower().lstrip("."),
+            enabled=True,
+            raw_path=str(Path("files_raw") / src.name),
+            text_path=str(Path("files_extracted") / text_path.name),
+            location_hint=extracted.location_hint,
         )
+        # replace if same id
+        sources = [s for s in sources if s.id != item.id]
+        sources.append(item)
 
-        ingested.append(src.name)
+        # chunk + upsert
+        chunks = chunk_text(
+            extracted.text,
+            source_id=item.id,
+            source_type=item.type,
+            base_location=item.location_hint or "Text",
+        )
+        upsert_chunks(chroma_dir, chunks)
 
-    return ingested
+        ingested_names.append(src.name)
+
+    _save_sources(username, notebook_id, sources)
+    return ingested_names
+
+
+def ingest_url(*, username: str, notebook_id: str, url: str) -> Optional[str]:
+    url = (url or "").strip()
+    if not url:
+        return None
+
+    nb = notebook_dir(username, notebook_id)
+    raw_dir = nb / "files_raw"
+    ext_dir = nb / "files_extracted"
+    chroma_dir = nb / "chroma"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    ext_dir.mkdir(parents=True, exist_ok=True)
+    chroma_dir.mkdir(parents=True, exist_ok=True)
+
+    extracted = extract_url(url)
+    # create safe id
+    safe_id = url.replace("https://", "").replace("http://", "").replace("/", "_")[:120]
+    source_id = f"url_{safe_id}.txt"
+
+    raw_path = raw_dir / source_id
+    raw_path.write_text(url, encoding="utf-8")
+
+    text_path = ext_dir / source_id
+    text_path.write_text(extracted.text, encoding="utf-8", errors="ignore")
+
+    sources = _load_sources(username, notebook_id)
+    item = SourceItem(
+        id=source_id,
+        type="url",
+        enabled=True,
+        raw_path=str(Path("files_raw") / source_id),
+        text_path=str(Path("files_extracted") / source_id),
+        location_hint="URL",
+    )
+    sources = [s for s in sources if s.id != item.id]
+    sources.append(item)
+    _save_sources(username, notebook_id, sources)
+
+    chunks = chunk_text(
+        extracted.text,
+        source_id=item.id,
+        source_type=item.type,
+        base_location=item.location_hint,
+    )
+    upsert_chunks(chroma_dir, chunks)
+    return source_id

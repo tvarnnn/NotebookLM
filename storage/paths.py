@@ -32,3 +32,6 @@ def ensure_notebook_dirs(username: str, notebook_id: str) -> None:
         root / "artifacts" / "podcasts",
     ]:
         p.mkdir(parents=True, exist_ok=True)
+
+def notebook_dir(username: str, notebook_id: str):
+    return notebook_root(username, notebook_id)
